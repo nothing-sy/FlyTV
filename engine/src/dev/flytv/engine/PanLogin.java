@@ -26,6 +26,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class PanLogin {
     private static final String UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
     private static final ConcurrentHashMap<String, String> SESSIONS = new ConcurrentHashMap<>(); // session -> qr token
+    private static final ConcurrentHashMap<String, JsonObject> QR_OK = new ConcurrentHashMap<>(); // session -> 已成功结果（防重叠轮询误报失效）
 
     /** 极简 HTTP：手动跟随重定向 + 收集 Set-Cookie。 */
     static class Resp {
@@ -140,6 +141,8 @@ public final class PanLogin {
         JsonObject out = new JsonObject();
         String token = session == null ? null : SESSIONS.get(session);
         if (token == null) {
+            JsonObject cached = session == null ? null : QR_OK.get(session);
+            if (cached != null) return cached;
             out.addProperty("status", "expired");
             out.addProperty("message", "二维码会话已失效，请刷新");
             return out;
@@ -160,6 +163,7 @@ public final class PanLogin {
             out.addProperty("nickname", info[1]);
             out.addProperty("member", info[2]);
             out.addProperty("message", "登录成功");
+            QR_OK.put(session, out);
             return out;
         }
         if (status == 50004002 || status == 50004003 || status == 50004004) {
@@ -198,9 +202,15 @@ public final class PanLogin {
         if (sign.isEmpty()) throw new Exception("获取百度二维码失败（接口返回异常，稍后再试）");
         String session = UUID.randomUUID().toString().replace("-", "");
         BAIDU.put(session, new Object[]{sign, gid, jar});
+        String png = imgurl.replace("\\/", "/");
+        if (!png.isEmpty() && !png.startsWith("http")) png = "https://" + png;
+        if (png.isEmpty()) png = "https://passport.baidu.com/v2/api/qrcode?sign=" + enc(sign) + "&lp=pc";
+        String link = o == null ? "" : JsonUtil.str(o, "link", "");
+        if (link.isEmpty()) link = "https://wappass.baidu.com/wp/?qrloginfrom=pc&tpl=netdisk&qrcode=1&sign=" + enc(sign);
         JsonObject out = new JsonObject();
         out.addProperty("session", session);
-        out.addProperty("url", "https://passport.baidu.com/v2/api/qrcode?sign=" + enc(sign) + "&lp=pc");
+        out.addProperty("img", png);
+        out.addProperty("url", link);
         return out;
     }
 
@@ -219,9 +229,9 @@ public final class PanLogin {
         long ts = System.currentTimeMillis();
         Resp r;
         try {
-            // 百度 unicast 是长轮询（挂到状态变化才返回）：短超时读取，超时视为"仍在等待"
-            r = getTO("https://passport.baidu.com/channel/unicast?channel_id=" + enc(sign) + "&tpl=netdisk&gid=" + enc(gid)
-                    + "&apiver=v3&tt=" + ts + "&_=" + ts, jar, 4500);
+            // 百度 unicast 长轮询：必须等状态变化；超时后立刻由前端重连，避免漏掉扫码事件
+            r = getTO("https://passport.baidu.com/channel/unicast?channel_id=" + enc(sign) + "&callback=&tpl=netdisk&gid=" + enc(gid)
+                    + "&apiver=v3&tt=" + ts + "&_=" + ts, jar, 35000);
         } catch (java.net.SocketTimeoutException te) {
             out.addProperty("status", "wait");
             out.addProperty("message", "等待扫码…");
@@ -231,7 +241,13 @@ public final class PanLogin {
             out.addProperty("message", "网络波动，继续等待…");
             return out;
         }
-        JsonObject o = JsonUtil.parseObj(r.body);
+        String raw = r.body == null ? "" : r.body.trim();
+        if (raw.startsWith("(") || (raw.length() > 0 && raw.charAt(0) != '{' && raw.contains("{"))) {
+            int lb = raw.indexOf('{');
+            int rb = raw.lastIndexOf('}');
+            if (lb >= 0 && rb > lb) raw = raw.substring(lb, rb + 1);
+        }
+        JsonObject o = JsonUtil.parseObj(raw);
         int errno = o == null ? -1 : JsonUtil.integer(o, "errno", -1);
         String cv = o == null ? "" : JsonUtil.str(o, "channel_v", "");
         int status = 0;
@@ -243,7 +259,8 @@ public final class PanLogin {
                 v = JsonUtil.str(c, "v", "");
             }
         }
-        if (status == 1 && !v.isEmpty()) {
+        // 官方：errno=1 未扫码；status=1 已扫码未确认；status=0 且 v 为确认登录；status=2 取消/失效
+        if (!v.isEmpty() && (status == 0 || status == 1)) {
             try {
                 get("https://passport.baidu.com/v3/login/main/qrbdusslogin?bduss=" + enc(v) + "&tpl=netdisk&apiver=v3&u="
                         + enc("https://pan.baidu.com/"), jar);
@@ -258,19 +275,25 @@ public final class PanLogin {
             out.addProperty("member", "");
             return out;
         }
-        if (status == 2) {
+        if (status == 1) {
             out.addProperty("status", "wait");
             out.addProperty("message", "已扫码，请在手机上确认登录");
             return out;
         }
-        if (errno != 0) {
+        if (status == 2) {
             BAIDU.remove(session);
             out.addProperty("status", "expired");
-            out.addProperty("message", "二维码已失效，请刷新");
+            out.addProperty("message", "已取消登录，请刷新二维码");
             return out;
         }
-        out.addProperty("status", "wait");
-        out.addProperty("message", "等待扫码…");
+        if (errno == 1 || errno == 0 || o == null) {
+            out.addProperty("status", "wait");
+            out.addProperty("message", "等待扫码…");
+            return out;
+        }
+        BAIDU.remove(session);
+        out.addProperty("status", "expired");
+        out.addProperty("message", "二维码已失效，请刷新");
         return out;
     }
 

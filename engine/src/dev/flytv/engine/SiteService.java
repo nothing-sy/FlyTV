@@ -320,7 +320,7 @@ public final class SiteService {
                             .compile("__([a-f0-9]{8,32})\\+([a-z0-9]{8,32})\\+([a-z0-9]{8,64})")
                             .matcher(epUrl == null ? "" : epUrl);
                     boolean found = m.find();
-                    boolean isPan = url.contains("do=pan") || (url.contains("127.0.0.1") && found);
+                    boolean isPan = url.contains("do=pan");
                     if (isPan && found) {
                         String savedFid = "";
                         try { savedFid = JarHost.get("/savedfid?siteKey=" + enc(site.key), 8000).trim(); } catch (Exception ignored) { }

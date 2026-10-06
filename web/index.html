@@ -526,8 +526,7 @@ border: 1px solid var(--stroke); flex: none; position: relative; box-shadow: var
     <div class="nav-item" data-panel="search"><span class="ico">🔍</span><span class="text">搜索</span></div>
     <div class="nav-item" data-panel="history"><span class="ico">🕐</span><span class="text">历史记录</span></div>
     <div class="nav-item" data-panel="keep"><span class="ico">⭐</span><span class="text">收藏</span></div>
-    <!-- 网盘登录页已隐藏：统一走「📥网盘丨配置中心」（gotoPanLogin 仍可直达本页） -->
-    <div class="nav-item" data-panel="pan" style="display:none"><span class="ico">📥</span><span class="text">网盘登录</span></div>
+    <div class="nav-item" data-panel="pan"><span class="ico">📥</span><span class="text">网盘配置</span></div>
     <div class="nav-item" data-panel="settings"><span class="ico">⚙️</span><span class="text">设置</span></div>
     <div class="spacer"></div>
   </div>
@@ -603,9 +602,9 @@ border: 1px solid var(--stroke); flex: none; position: relative; box-shadow: var
         <div class="status" id="keepStatus"></div>
       </div>
 
-      <!-- 网盘登录 -->
+      <!-- 网盘配置 -->
       <div class="panel" id="panelPan">
-        <div class="title-row">网盘登录 <button class="btn ghost sm" onclick="openPanel(window._prevPanel || 'vod')">← 返回</button> <button class="btn ghost sm" onclick="loadPan()">刷新</button></div>
+        <div class="title-row">网盘配置 <button class="btn ghost sm" onclick="loadPan()">刷新</button></div>
         <div class="cards" id="panCards"></div>
         <div style="color:var(--text3);font-size:12px;margin-top:14px;max-width:760px">
           扫码登录：夸克 / 百度 / 阿里云盘 点「扫码登录」后用对应 App 扫描即可，引擎自动保存凭证；UC 网盘可点「粘贴 Cookie」手动导入。
@@ -1037,13 +1036,17 @@ document.querySelectorAll('.nav-item').forEach(item => { item.onclick = () => op
 
 // ---------- 站点（自定义下拉） ----------
 let allSites = [];
+function isCfgCenterSite(s) {
+  return !!(s && (s.key === '配置中心' || /配置中心/.test(s.name || '') || /配置中心/.test(s.key || '')));
+}
 async function initSites() {
   try {
     const j = await api('sites');
     allSites = j.sites || [];
-    const keys = new Set(allSites.map(s => s.key));
+    const playSites = allSites.filter(s => !isCfgCenterSite(s));
+    const keys = new Set(playSites.map(s => s.key));
     const urlSite = new URLSearchParams(location.search).get('site');
-    curSite = (urlSite && keys.has(urlSite) ? urlSite : null) || ['玩耦', '玩偶', '快映', '木偶'].find(k => keys.has(k)) || (keys.has(j.home) ? j.home : null) || (allSites[0] && allSites[0].key) || '';
+    curSite = (urlSite && keys.has(urlSite) ? urlSite : null) || ['玩耦', '玩偶', '快映', '木偶'].find(k => keys.has(k)) || (keys.has(j.home) ? j.home : null) || (playSites[0] && playSites[0].key) || '';
     setSiteLabel();
     renderSiteList();
     loadHome();
@@ -1056,7 +1059,7 @@ function setSiteLabel() {
 }
 function renderSiteList() {
   const q = ($('siteFilter').value || '').trim().toLowerCase();
-  const list = allSites.filter(s => !q || (s.name || '').toLowerCase().includes(q) || (s.key || '').toLowerCase().includes(q));
+  const list = allSites.filter(s => !isCfgCenterSite(s) && (!q || (s.name || '').toLowerCase().includes(q) || (s.key || '').toLowerCase().includes(q)));
   const box = $('siteList');
   if (!list.length) { box.innerHTML = '<div class="site-empty">无匹配站点</div>'; return; }
   box.innerHTML = list.map(s =>
@@ -1993,7 +1996,7 @@ async function loadPan() {
   } catch (e) { box.innerHTML = '<div class="status">读取失败: ' + esc(e.message) + '</div>'; }
 }
 // ---- 扫码登录（夸克 / 百度 / 阿里云盘） ----
-let qrSession = null, qrTimer = null, qrDrive = 'quark';
+let qrSession = null, qrTimer = null, qrDrive = 'quark', qrPollInflight = 0, qrDone = false, qrLoop = 0;
 async function panLogin(id, name) {
   if (!panQrDrives.includes(id)) {
     toast('「' + name + '」暂未支持扫码，请用「粘贴 Cookie」导入');
@@ -2007,7 +2010,8 @@ async function panLogin(id, name) {
   await qrRefresh();
 }
 async function qrRefresh() {
-  clearInterval(qrTimer); qrTimer = null;
+  clearInterval(qrTimer); qrTimer = null; qrDone = false; qrPollInflight = 0;
+  const loop = ++qrLoop;
   $('qrBox').innerHTML = '';
   $('qrStatus').textContent = '正在获取二维码…';
   try {
@@ -2023,14 +2027,23 @@ async function qrRefresh() {
       new QRCode($('qrBox'), { text: j.url, width: 200, height: 200, correctLevel: QRCode.CorrectLevel.M });
     }
     $('qrStatus').textContent = '等待扫码…';
-    qrTimer = setInterval(pollQr, 2000);
+    pollQrLoop(loop);
   } catch (e) { $('qrStatus').textContent = '获取失败：' + e.message; }
 }
+async function pollQrLoop(loop) {
+  while (loop === qrLoop && qrSession && !qrDone) {
+    await pollQr();
+  }
+}
 async function pollQr() {
-  if (!qrSession) return;
+  if (!qrSession || qrDone || qrPollInflight > 0) return;
+  const sessAtStart = qrSession;
+  qrPollInflight++;
   try {
-    const j = await api('pan/qr/poll', { drive: qrDrive, session: qrSession });
+    const j = await api('pan/qr/poll', { drive: qrDrive, session: sessAtStart });
+    if (qrDone || (j.status !== 'ok' && qrSession !== sessAtStart)) return;
     if (j.status === 'ok') {
+      qrDone = true;
       clearInterval(qrTimer); qrTimer = null; qrSession = null;
       $('qrStatus').textContent = '✅ 登录成功' + (j.nickname ? '：' + j.nickname : '') + (j.member ? '（' + j.member + '）' : '');
       toast('网盘登录成功' + (j.nickname ? '：' + j.nickname : ''));
@@ -2042,8 +2055,11 @@ async function pollQr() {
       $('qrStatus').textContent = j.message || '等待扫码…';
     }
   } catch (e) { /* 单次网络错误忽略，继续轮询 */ }
+  finally { qrPollInflight = Math.max(0, qrPollInflight - 1); }
 }
 function closeQr() {
+  qrDone = true;
+  qrLoop++;
   clearInterval(qrTimer); qrTimer = null; qrSession = null;
   $('qrModal').classList.remove('show');
 }
@@ -2848,7 +2864,10 @@ function startPlayer(url, title, startMs, adoptHls, adoptMini) {
     video.src = url;
   }
   video.onplaying = () => { $('playerTip').style.display = 'none'; if (playCtx) playCtx.retryCount = 0; };
-  video.onerror = () => { scheduleRetry('视频加载失败'); };
+  video.onerror = () => {
+    const u = String((playCtx && playCtx.resolved) || url || '');
+    scheduleRetry(/baidu|do=pan/.test(u) ? '403 百度拉流失败' : '视频加载失败');
+  };
   // 播放结束：剧集自动连播下一集；最后一集提示（单集电影不弹任何提示）
   video.onended = async () => {
     if (!playCtx) return;

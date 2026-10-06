@@ -48,8 +48,10 @@ public class Host {
     static final Map<String, Path> CONVERTED = new ConcurrentHashMap<>();
     static volatile String proxyBase = "";
     static volatile String configBase = "";
+    static final ThreadLocal<String> LAST_BAIDU_JSON = new ThreadLocal<>();
 
     public static void main(String[] args) throws Exception {
+        hookSpiderOut();
         Files.createDirectories(DATA_DIR);
         ensureDefaultConfig();
         try {
@@ -579,8 +581,20 @@ public class Host {
             } catch (Exception ignored) { }
         }
         Session s = SESSIONS.get(query.getOrDefault("siteKey", ""));
+        if (s == null) s = SESSIONS.get(query.getOrDefault("site", ""));
+        if (s == null && !SESSIONS.isEmpty()) s = SESSIONS.values().iterator().next();
+        ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+        ex.getResponseHeaders().set("Access-Control-Allow-Headers", "*");
+        ex.getResponseHeaders().set("Access-Control-Allow-Methods", "GET,OPTIONS");
+        if ("OPTIONS".equalsIgnoreCase(ex.getRequestMethod())) {
+            ex.sendResponseHeaders(204, -1);
+            return;
+        }
         if (s == null) { sendError(ex, 500, "proxy site not loaded"); return; }
-        Object[] rs = invokeProxy(s.spider, query);
+        // 中文 siteKey 被爬虫写进 OkHttp Header 会直接抛 IllegalArgumentException
+        if (!headerSafe(query.get("siteKey"))) query.remove("siteKey");
+        if (!headerSafe(query.get("site"))) query.remove("site");
+        Object[] rs = invokeProxyRetryBaidu(s.spider, query);
         if (rs == null || rs.length < 3) { sendError(ex, 500, "proxy invalid response"); return; }
         int code = Integer.parseInt(String.valueOf(rs[0]));
         String mime = String.valueOf(rs[1]);
@@ -613,6 +627,228 @@ public class Host {
         } catch (IOException ignored) { }
     }
 
+    static boolean headerSafe(String v) {
+        if (v == null) return true;
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            if (c < 32 || c > 126) return false;
+        }
+        return true;
+    }
+
+    static Object[] normalizeProxyRs(Object[] rs) {
+        if (rs == null || rs.length < 3 || !(rs[2] instanceof InputStream)) return rs;
+        String mime = String.valueOf(rs[1]).toLowerCase();
+        InputStream in = (InputStream) rs[2];
+        try {
+            byte[] head = new byte[512];
+            int n = 0, r;
+            while (n < head.length && (r = in.read(head, n, head.length - n)) > 0) n += r;
+            if (n <= 0) return rs;
+            int b0 = head[0] & 0xff;
+            boolean likelyText = mime.contains("text") || mime.contains("json") || mime.contains("javascript")
+                    || b0 == '{' || b0 == '[' || b0 == 'h' || b0 == '<';
+            if (!likelyText) {
+                rs[2] = new java.io.SequenceInputStream(new ByteArrayInputStream(head, 0, n), in);
+                return rs;
+            }
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            bos.write(head, 0, n);
+            byte[] buf = new byte[8192];
+            while ((r = in.read(buf)) > 0 && bos.size() < 2000000) bos.write(buf, 0, r);
+            try { in.close(); } catch (Exception ignored) { }
+            rs[2] = bos.toByteArray();
+        } catch (Exception ignored) { }
+        return rs;
+    }
+
+    static String proxyPayloadText(Object[] rs) {
+        if (rs == null || rs.length < 3 || rs[2] == null) return "";
+        Object p = rs[2];
+        if (p instanceof InputStream) return "";
+        if (p instanceof byte[]) return new String((byte[]) p, StandardCharsets.UTF_8);
+        return String.valueOf(p);
+    }
+
+    static Object[] redirectBaiduDlink(String dlink) {
+        String loc = "http://127.0.0.1:" + PORT + "/jarstream?drive=baidu&url=" + enc(dlink);
+        Map<String, String> h = new HashMap<>();
+        h.put("Location", loc);
+        return new Object[]{302, "text/plain", "", h};
+    }
+
+    static void hookSpiderOut() {
+        final PrintStream orig = System.out;
+        System.setOut(new PrintStream(orig, true) {
+            @Override public void println(String x) { orig.println(x); captureBaiduLog(x); }
+            @Override public void println(Object x) { orig.println(x); captureBaiduLog(String.valueOf(x)); }
+        });
+    }
+
+    static void captureBaiduLog(String x) {
+        if (x == null) return;
+        if (x.contains("dlink") && x.contains("adToken")) {
+            int i = x.indexOf('{');
+            if (i >= 0) LAST_BAIDU_JSON.set(x.substring(i));
+        }
+    }
+
+    static Object[] fromCapturedBaidu() {
+        String raw = LAST_BAIDU_JSON.get();
+        if (raw == null || raw.isEmpty()) return null;
+        try {
+            JSONObject o = new JSONObject(raw);
+            JSONObject info = o.optJSONObject("info");
+            String dlink = info != null ? info.optString("dlink", "") : "";
+            int ltime = info != null ? info.optInt("ltime", 5) : 5;
+            int errno = o.optInt("errno", -1);
+            if (dlink.isEmpty()) return null;
+            if (errno == 133) {
+                if (ltime < 1) ltime = 1;
+                if (ltime > 12) ltime = 12;
+                try { Thread.sleep(ltime * 1000L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            }
+            return redirectBaiduDlink(dlink);
+        } catch (Exception e) { return null; }
+    }
+
+    static String baiduHttpBody(java.lang.reflect.Method dm, String url, Map<String, String> headers) {
+        try {
+            Object resp = dm.invoke(null, url, headers);
+            Object bodyObj = resp.getClass().getMethod("body").invoke(resp);
+            return (String) bodyObj.getClass().getMethod("string").invoke(bodyObj);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    static Object[] baiduOwnStreaming(Map<String, String> q) {
+        String cookie = readBaiduCookie();
+        String fileId = q.getOrDefault("fileId", "");
+        String fileToken = q.getOrDefault("fileToken", "");
+        String ad = q.getOrDefault("adToken", "");
+        if (cookie.isEmpty() || fileId.isEmpty() || SESSIONS.isEmpty()) return null;
+        if (!fileToken.isEmpty() && !cookie.contains("BDCLND")) cookie = cookie + "; BDCLND=" + fileToken;
+        Session s = SESSIONS.values().iterator().next();
+        try {
+            Class<?> kb = s.loader.loadClass("com.github.catvod.spider.merge.k.b");
+            java.lang.reflect.Method dm = kb.getMethod("d", String.class, java.util.Map.class);
+            HashMap<String, String> headers = new HashMap<>();
+            headers.put("Cookie", cookie);
+            headers.put("User-Agent", "netdisk;P2SP;3.0.0.8;netdisk;11.32.3;android-android;11;JSbridge4.4.0;jointBridge;1.1.0;");
+            headers.put("Referer", "https://pan.baidu.com/disk/home");
+            String[] apis = new String[] {
+                    "https://pan.baidu.com/api/streaming?app_id=250528&clienttype=1&embed=1&type=M3U8_AUTO_720&fid=" + fileId + "&adToken=" + enc(ad),
+                    "https://pan.baidu.com/rest/2.0/xpan/multimedia?method=filemetas&dlink=1&fsids=%5B" + fileId + "%5D",
+                    "https://d.pcs.baidu.com/rest/2.0/pcs/file?method=locatedownload&app_id=250528&fid=" + fileId
+            };
+            for (int pass = 0; pass < 2; pass++) {
+                for (int i = 0; i < apis.length; i++) {
+                    String text = baiduHttpBody(dm, apis[i], headers);
+                    if (text == null || text.isEmpty()) continue;
+                    String head = text.length() > 100 ? text.substring(0, 100) : text;
+                    if (text.trim().startsWith("#EXTM3U")) return redirectBaiduDlink(apis[i]);
+                    int brace = text.indexOf('{');
+                    if (brace < 0) continue;
+                    JSONObject o = new JSONObject(text.substring(brace));
+                    int errno = o.optInt("errno", o.optInt("error_code", -1));
+                    JSONObject info = o.optJSONObject("info");
+                    String dlink = info != null ? info.optString("dlink", "") : o.optString("dlink", "");
+                    if (dlink.isEmpty() && o.optJSONArray("urls") != null && o.optJSONArray("urls").length() > 0)
+                        dlink = o.getJSONArray("urls").getJSONObject(0).optString("url", "");
+                    if (dlink.isEmpty() && o.optJSONArray("list") != null && o.optJSONArray("list").length() > 0)
+                        dlink = o.getJSONArray("list").getJSONObject(0).optString("dlink", "");
+                    if (errno == 133 && info != null && pass == 0) {
+                        String ad2 = info.optString("adToken", "");
+                        int ltime = info.optInt("ltime", 5);
+                        if (!ad2.isEmpty()) {
+                            if (ltime < 1) ltime = 1;
+                            if (ltime > 12) ltime = 12;
+                            try { Thread.sleep(ltime * 1000L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                            ad = ad2;
+                            apis[0] = "https://pan.baidu.com/api/streaming?app_id=250528&clienttype=1&embed=1&type=M3U8_AUTO_720&fid=" + fileId + "&adToken=" + enc(ad);
+                            break;
+                        }
+                    }
+                    if (!dlink.isEmpty()) return redirectBaiduDlink(dlink);
+                }
+            }
+        } catch (Exception e) {
+        }
+        return null;
+    }
+
+
+    /** 百度 errno=133 需带 adToken 等待 ltime 后再请求，否则代理体会是 JSON 而不是视频。 */
+    static Object[] invokeProxyRetryBaidu(com.github.catvod.crawler.Spider spider, Map<String, String> query) throws Exception {
+        LAST_BAIDU_JSON.remove();
+        Object[] rs;
+        try {
+            rs = normalizeProxyRs(invokeProxy(spider, query));
+        } catch (Exception e) {
+            Object[] cap = fromCapturedBaidu();
+            if (cap != null) return cap;
+            Object[] own = baiduOwnStreaming(query);
+            if (own != null) return own;
+            throw e;
+        }
+        String body = proxyPayloadText(rs);
+        if (body.contains("播放链接") || body.contains("为空")) {
+            Object[] cap = fromCapturedBaidu();
+            if (cap != null) return cap;
+            Object[] own = baiduOwnStreaming(query);
+            if (own != null) return own;
+            return new Object[]{502, "text/plain", body.getBytes(StandardCharsets.UTF_8)};
+        }
+        int retried = 0;
+        boolean hit133 = body.contains("adToken") && body.contains("133");
+        while (hit133 && retried < 2) {
+            String ad = "";
+            int ltime = 5;
+            String dlink = "";
+            try {
+                JSONObject o = new JSONObject(body);
+                JSONObject info = o.optJSONObject("info");
+                if (info != null) {
+                    ad = info.optString("adToken", "");
+                    ltime = info.optInt("ltime", 5);
+                    dlink = info.optString("dlink", "");
+                }
+            } catch (Exception ignored) { }
+            if (ad.isEmpty()) {
+                if (!dlink.isEmpty()) return redirectBaiduDlink(dlink);
+                break;
+            }
+            if (ltime < 1) ltime = 1;
+            if (ltime > 12) ltime = 12;
+            try { Thread.sleep(ltime * 1000L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            query.put("adToken", ad);
+            retried++;
+            try {
+                rs = normalizeProxyRs(invokeProxy(spider, query));
+                body = proxyPayloadText(rs);
+            } catch (Exception e) {
+                if (!dlink.isEmpty()) return redirectBaiduDlink(dlink);
+                throw e;
+            }
+            hit133 = body.contains("adToken") && body.contains("133");
+        }
+        String trim = body.trim();
+        if (trim.startsWith("http://") || trim.startsWith("https://")) {
+            return redirectBaiduDlink(trim.split("\\s")[0]);
+        }
+        if (trim.startsWith("{") && body.contains("dlink")) {
+            try {
+                JSONObject o = new JSONObject(body);
+                JSONObject info = o.optJSONObject("info");
+                String dlink = info != null ? info.optString("dlink", "") : o.optString("dlink", "");
+                int errno = o.optInt("errno", -1);
+                if (!dlink.isEmpty()) return redirectBaiduDlink(dlink);
+            } catch (Exception ignored) { }
+        }
+        return rs;
+    }
+
     /** both proxy method names: FongMi proxy(Map), legacy proxyLocal(Map). prefer subclass override. */
     static Object[] invokeProxy(com.github.catvod.crawler.Spider spider, Map<String, String> query) throws Exception {
         for (String name : new String[]{"proxy", "proxyLocal"}) {
@@ -642,18 +878,25 @@ public class Host {
         String siteKey = query.getOrDefault("siteKey", "");
         String url = query.getOrDefault("url", "");
         Session s = SESSIONS.get(siteKey);
+        if (s == null && !SESSIONS.isEmpty()) s = SESSIONS.values().iterator().next();
         if (s == null || url.isEmpty()) { sendError(ex, 500, "jarstream: bad request"); return; }
         try {
-        String cookie = readPanCookie();
-        if (cookie.isEmpty()) log("jarstream: 警告：未找到夸克 Cookie（CDN 会返回 412，请先在网盘页登录）");
-        else if (!cookie.contains("__puus")) log("jarstream: 警告：Cookie 缺少 __puus 字段（CDN 可能拒绝）");
+        boolean baidu = "baidu".equalsIgnoreCase(query.getOrDefault("drive", ""))
+                || url.contains("baidu.com") || url.contains("pcs.baidu");
+        String cookie = baidu ? readBaiduCookie() : readPanCookie();
+        if (cookie.isEmpty()) log("jarstream: 警告：未找到" + (baidu ? "百度" : "夸克") + " Cookie");
         Class<?> kb = s.loader.loadClass("com.github.catvod.spider.merge.k.b");
             Method dm = kb.getMethod("d", String.class, java.util.Map.class);
             HashMap<String, String> headers = new HashMap<>();
-            headers.put("Referer", "https://pan.quark.cn");
-            headers.put("Origin", "https://pan.quark.cn");
+            if (baidu) {
+                headers.put("Referer", "https://pan.baidu.com/disk/home");
+                headers.put("User-Agent", "netdisk;P2SP;3.0.0.8;netdisk;11.32.3;android-android;11;JSbridge4.4.0;jointBridge;1.1.0;");
+            } else {
+                headers.put("Referer", "https://pan.quark.cn");
+                headers.put("Origin", "https://pan.quark.cn");
+                headers.put("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/3.0.1 Chrome/100.0.4896.160 Electron/18.3.5.12-a038f7b798 Safari/537.36 Channel/pckk_other_ch");
+            }
             if (!cookie.isEmpty()) headers.put("Cookie", cookie);
-            headers.put("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/3.0.1 Chrome/100.0.4896.160 Electron/18.3.5.12-a038f7b798 Safari/537.36 Channel/pckk_other_ch");
             // Range 透传：播放器可能带 Range 头
             String range = ex.getRequestHeaders().getFirst("Range");
             // 关键：bytes=0-（全文件）不透传 —— 若上游回 206+Content-Range，ffmpeg 会把连接当作
@@ -909,6 +1152,33 @@ public class Host {
             } catch (Throwable ignored) { }
         }
         log("readPanCookie: no valid cookie found in any candidate path");
+        return "";
+    }
+
+    static String readBaiduCookie() {
+        Path tmpDir = java.nio.file.Paths.get(android.os.Environment.getExternalStorageDirectory().getAbsolutePath(), "TVBox");
+        Path[] candidates = {
+                tmpDir.resolve("baidu.txt"),
+                tmpDir.resolve("baidu_cookie.txt"),
+                tmpDir.resolve("baidu"),
+                DATA_DIR.resolve("files").resolve("lzxw").resolve("baidu.txt"),
+                DATA_DIR.resolve("files").resolve("Pizazz").resolve("baidu.txt")
+        };
+        for (Path p : candidates) {
+            try {
+                if (!Files.exists(p) || Files.size(p) <= 10) continue;
+                String text = new String(Files.readAllBytes(p), StandardCharsets.UTF_8).trim();
+                if (text.startsWith("\uFEFF")) text = text.substring(1).trim();
+                if (text.startsWith("{")) {
+                    String c = new JSONObject(text).optString("cookie", "");
+                    if (c.isEmpty()) c = new JSONObject(text).optString("BDUSS", "");
+                    if (!c.isEmpty()) return c;
+                } else if (text.contains("BDUSS") || (text.contains("=") && !text.contains("\n"))) {
+                    return text;
+                }
+            } catch (Throwable ignored) { }
+        }
+        log("readBaiduCookie: not found");
         return "";
     }
 

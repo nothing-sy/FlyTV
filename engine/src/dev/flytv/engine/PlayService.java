@@ -22,7 +22,11 @@ public final class PlayService {
                 if (m.isEmpty()) m = JsonUtil.str(pr, "errMsg", "");
                 return err(m.isEmpty() ? "未获取到播放地址" : m);
             }
-            if (PanService.isPanUrl(url)) {
+            if (url.contains("/proxy") && !url.contains("siteKey=") && isAsciiKey(site.key)) {
+                url += (url.contains("?") ? "&" : "?") + "siteKey=" + enc(site.key);
+                pr.addProperty("url", url);
+            }
+            if (isQuarkPanUrl(url)) {
                 String relay = PanService.resolveToRelay(url);
                 JsonObject o = new JsonObject();
                 o.addProperty("url", relay);
@@ -44,16 +48,18 @@ public final class PlayService {
      */
     public static JsonObject check(String url) {
         JsonObject o = new JsonObject();
-        boolean local = url != null && (url.startsWith("http://127.0.0.1:9790/jarstream") || url.startsWith("http://127.0.0.1:9978/proxy"));
+        boolean local = url != null && (url.contains("127.0.0.1:9790/jarstream")
+                || url.contains("127.0.0.1:9978/proxy") || url.contains("/proxy?do=pan"));
         if (!local) { o.addProperty("ok", true); o.addProperty("skip", true); return o; }
         HttpURLConnection c = null;
         try {
             c = (HttpURLConnection) new URL(url).openConnection();
+            c.setInstanceFollowRedirects(false);
             c.setRequestProperty("Range", "bytes=0-1023");
             c.setConnectTimeout(8000);
-            c.setReadTimeout(25000);
+            c.setReadTimeout(40000);
             int code = c.getResponseCode();
-            if (code == 200 || code == 206) { o.addProperty("ok", true); return o; }
+            if (code == 200 || code == 206 || (code >= 300 && code < 400)) { o.addProperty("ok", true); return o; }
             InputStream is = code >= 400 ? c.getErrorStream() : c.getInputStream();
             String body = is == null ? "" : readSnippet(is, 1500);
             String lower = body.toLowerCase();
@@ -95,6 +101,24 @@ public final class PlayService {
         JsonObject o = new JsonObject();
         o.addProperty("error", msg == null ? "播放失败" : msg);
         return o;
+    }
+
+    static boolean isQuarkPanUrl(String url) {
+        if (url == null || !PanService.isPanUrl(url)) return false;
+        if (!url.contains("fileId=") || !url.contains("siteKey=")) return false;
+        String u = url.toLowerCase();
+        if (u.contains("baidu") || u.contains("type=bd") || u.contains("type=uc") || u.contains("type=ali")) return false;
+        return true;
+    }
+
+    static String enc(String s) {
+        try { return java.net.URLEncoder.encode(s == null ? "" : s, "UTF-8"); } catch (Exception e) { return ""; }
+    }
+
+    static boolean isAsciiKey(String k) {
+        if (k == null || k.isEmpty()) return false;
+        for (int i = 0; i < k.length(); i++) if (k.charAt(i) < 33 || k.charAt(i) > 126) return false;
+        return true;
     }
 
     public static VodConfig.Site findSite(String key) {
